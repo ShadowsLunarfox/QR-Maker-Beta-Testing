@@ -1,0 +1,3 @@
+-r requirements.txt
+zxing-cpp>=2.3
+resvg-py
