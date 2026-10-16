@@ -8,14 +8,17 @@ import ipaddress
 import math
 import re
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 from xml.sax.saxutils import escape
 
 import qrcode
-from PIL import Image, ImageColor, ImageDraw, ImageOps
+from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageOps
 from qrcode.exceptions import DataOverflowError
 from qrcode.util import pattern_position
+
+from .content import build_payload, content_description
 
 
 SHAPES = ("Square", "Rounded", "Dots", "Diamond")
@@ -52,6 +55,24 @@ class Options:
     logo_plate: bool = True
     plate_color: str = "#ffffff"
     plate_style: str = "Rounded"
+    content_type: str = "URL"
+    text: str = ""
+    wifi_ssid: str = ""
+    wifi_password: str = ""
+    wifi_security: str = "WPA"
+    wifi_hidden: bool = False
+    contact_name: str = ""
+    contact_phone: str = ""
+    contact_email: str = ""
+    contact_organization: str = ""
+    contact_address: str = ""
+    contact_url: str = ""
+    phone: str = ""
+    email_to: str = ""
+    email_subject: str = ""
+    email_body: str = ""
+    logo_crop: str = "Fit"
+    logo_padding: int = 0
 
 
 @dataclass(frozen=True)
@@ -64,13 +85,14 @@ class Shape:
 @dataclass
 class Design:
     options: Options
-    matrix: list[list[bool]]
+    matrix: tuple[tuple[bool, ...], ...]
     version: int
     modules: list[Shape]
     structure: list[Shape]
     logo: Image.Image | None
     logo_box: tuple[float, float, float, float] | None
     warnings: list[str]
+    payload: str
 
     @property
     def cells(self) -> int:
@@ -128,11 +150,34 @@ def _contrast(a: tuple[int, ...], b: tuple[int, ...]) -> float:
     return (y + .05) / (x + .05)
 
 
+@lru_cache(maxsize=16)
+def _encode_url(url: str) -> tuple[tuple[tuple[bool, ...], ...], int]:
+    """Share immutable QR data while a user adjusts the design."""
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_H, border=0)
+    try:
+        qr.add_data(url)
+        qr.make(fit=True)
+    except (DataOverflowError, ValueError) as exc:
+        raise ValueError("This content is too long for a QR code. Try shortening it.") from exc
+    return tuple(tuple(row) for row in qr.get_matrix()), qr.version
+
+
+@lru_cache(maxsize=4)
+def _load_logo(path, modified, length):
+    with Image.open(path) as source:
+        source.load()
+        image = ImageOps.exif_transpose(source).convert("RGBA")
+    image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+    return image
+
+
 def build_design(options: Options) -> Design:
-    opts = replace(options, url=normalize_url(options.url))
+    payload = build_payload(options)
+    opts = replace(options, url=payload) if options.content_type == "URL" else options
     for name, low, high in (
         ("size", 256, 4096), ("border", 4, 12), ("foreground_opacity", 10, 100),
         ("background_opacity", 0, 100), ("logo_size", 8, 24), ("logo_opacity", 0, 100),
+        ("logo_padding", 0, 30),
     ):
         value = getattr(opts, name)
         if not isinstance(value, int) or not low <= value <= high:
@@ -143,27 +188,23 @@ def build_design(options: Options) -> Design:
         raise ValueError("Choose a supported corner or logo plate style.")
     if opts.rotation not in (0, 90, 180, 270):
         raise ValueError("Rotation must be 0, 90, 180, or 270 degrees.")
+    if opts.logo_crop not in ("Fit", "Center crop", "Circle"):
+        raise ValueError("Choose Fit, Center crop, or Circle for the logo.")
     colors = {key: _color(getattr(opts, key)) for key in (
         "foreground", "secondary", "background", "finder_color", "plate_color"
     )}
-    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_H, border=0)
-    try:
-        qr.add_data(opts.url)
-        qr.make(fit=True)
-    except (DataOverflowError, ValueError) as exc:
-        raise ValueError("This URL is too long for a QR code. Try a shorter link.") from exc
-    matrix = qr.get_matrix()
+    matrix, version = _encode_url(payload)
     n, border = len(matrix), opts.border
     cell = opts.size / (n + 2 * border)
     modules, structure = [], []
     finders = ((0, 0), (n - 7, 0), (0, n - 7))
-    align = pattern_position(qr.version)
+    align = pattern_position(version)
 
     def protected(x, y):
         return (
             x in (6, 8) or y in (6, 8)
             or any(abs(x - cx) <= 2 and abs(y - cy) <= 2 for cx in align for cy in align)
-            or (qr.version >= 7 and ((x >= n - 11 and y < 6) or (y >= n - 11 and x < 6)))
+            or (version >= 7 and ((x >= n - 11 and y < 6) or (y >= n - 11 and x < 6)))
         )
 
     for y, row in enumerate(matrix):
@@ -188,9 +229,9 @@ def build_design(options: Options) -> Design:
     logo, logo_box = None, None
     if opts.logo_path:
         try:
-            with Image.open(opts.logo_path) as source:
-                source.load()
-                logo = ImageOps.exif_transpose(source).convert("RGBA")
+            path = Path(opts.logo_path).resolve()
+            info = path.stat()
+            logo = _load_logo(str(path), info.st_mtime_ns, info.st_size).copy()
         except (OSError, ValueError, Image.DecompressionBombError) as exc:
             raise ValueError("The logo could not be opened. Choose a PNG, JPG, or WebP image.") from exc
         # Limit the entire occluded area, including its plate, to the requested fraction.
@@ -199,7 +240,20 @@ def build_design(options: Options) -> Design:
         logo_box = (start, start, start + side, start + side)
         padding = (.16 if opts.plate_style == "Circle" else .13) if opts.logo_plate else 0
         fitted = max(1, round(side * (1 - 2 * padding)))
-        logo.thumbnail((fitted, fitted), Image.Resampling.LANCZOS)
+        inner = max(1, round(fitted * (1 - opts.logo_padding / 100 * 2)))
+        if opts.logo_crop == "Fit":
+            logo.thumbnail((inner, inner), Image.Resampling.LANCZOS)
+        else:
+            logo = ImageOps.fit(logo, (inner, inner), method=Image.Resampling.LANCZOS, centering=(.5, .5))
+            if opts.logo_crop == "Circle":
+                mask = Image.new("L", (inner * 2, inner * 2), 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, inner * 2 - 1, inner * 2 - 1), fill=255)
+                mask = mask.resize((inner, inner), Image.Resampling.LANCZOS)
+                logo.putalpha(ImageChops.multiply(logo.getchannel("A"), mask))
+        if opts.logo_padding:
+            padded = Image.new("RGBA", (fitted, fitted), (0, 0, 0, 0))
+            padded.alpha_composite(logo, ((fitted - logo.width) // 2, (fitted - logo.height) // 2))
+            logo = padded
         if opts.logo_opacity != 100:
             logo.putalpha(logo.getchannel("A").point(lambda a: round(a * opts.logo_opacity / 100)))
 
@@ -219,7 +273,7 @@ def build_design(options: Options) -> Design:
         warnings.append("A smaller logo is easier to scan. Try 18–20% if needed.")
     if cell < 4:
         warnings.append("This link is dense at this size. Export a larger image.")
-    return Design(opts, matrix, qr.version, modules, structure, logo, logo_box, warnings)
+    return Design(opts, matrix, version, modules, structure, logo, logo_box, warnings, payload)
 
 
 def _draw_shape(draw: ImageDraw.ImageDraw, shape: Shape, scale: float, fill=255):
@@ -243,23 +297,37 @@ def _draw_shape(draw: ImageDraw.ImageDraw, shape: Shape, scale: float, fill=255)
         draw.rectangle(box, fill=fill)
 
 
+@lru_cache(maxsize=8)
+def _gradient_mask(effect: str, side: int) -> Image.Image:
+    coordinates = [i / max(1, side - 1) for i in range(side)]
+    if effect == "Horizontal":
+        pixels = bytes(round(u * 255) for u in coordinates) * side
+    elif effect == "Vertical":
+        pixels = b"".join(bytes([round(v * 255)]) * side for v in coordinates)
+    elif effect == "Diagonal":
+        pixels = bytes(round((u + v) * 127.5) for v in coordinates for u in coordinates)
+    else:
+        pixels = bytes(round(min(1, math.hypot(u - .5, v - .5) * 2) * 255)
+                       for v in coordinates for u in coordinates)
+    return Image.frombytes("L", (side, side), pixels)
+
+
+@lru_cache(maxsize=16)
+def _gradient_field(effect: str, a: tuple[int, ...], b: tuple[int, ...], side: int) -> Image.Image:
+    mask = _gradient_mask(effect, side)
+    channels = [mask.point([round(start + (end - start) * i / 255) for i in range(256)])
+                for start, end in zip(a, b)]
+    return Image.merge("RGB", channels)
+
+
 def _gradient(design: Design, side: int) -> Image.Image:
     opts = design.options
     a, b = _color(opts.foreground), _color(opts.secondary)
     if opts.gradient == "Solid":
         return Image.new("RGBA", (side, side), (*a, 255))
-    # A small color field is resized smoothly; QR edges use separate full-resolution masks.
-    field_side = min(256, side)
-    pixels = []
-    for y in range(field_side):
-        for x in range(field_side):
-            u, v = x / (field_side - 1), y / (field_side - 1)
-            t = {"Horizontal": u, "Vertical": v, "Diagonal": (u + v) / 2,
-                 "Radial": min(1, math.hypot(u - .5, v - .5) * 2)}[opts.gradient]
-            pixels.append(tuple(round(s + (e - s) * t) for s, e in zip(a, b)) + (255,))
-    result = Image.new("RGBA", (field_side, field_side))
-    result.putdata(pixels)
-    return result.resize((side, side), Image.Resampling.BILINEAR)
+    # Cache only small fields. Full-resolution export layers stay temporary.
+    field = _gradient_field(opts.gradient, a, b, min(256, side))
+    return field.resize((side, side), Image.Resampling.BILINEAR).convert("RGBA")
 
 
 def render_image(design: Design, size: int | None = None) -> Image.Image:
@@ -328,7 +396,7 @@ def render_svg(design: Design) -> str:
     opts = design.options
     color = lambda value: "#%02x%02x%02x" % _color(value)
     pieces = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{opts.size}" height="{opts.size}" viewBox="0 0 {opts.size} {opts.size}">',
-              f'<title>QR code for {escape(opts.url)}</title>']
+              f'<title>{escape(content_description(opts))}</title>']
     fill = color(opts.foreground)
     if opts.gradient != "Solid":
         stops = f'<stop stop-color="{fill}"/><stop offset="1" stop-color="{color(opts.secondary)}"/>'
@@ -364,21 +432,34 @@ def render_svg(design: Design) -> str:
     return '\n'.join(pieces)
 
 
-def save_design(design: Design, destination: str | Path) -> Path:
-    path = Path(destination)
-    suffix = path.suffix.lower()
+def export_bytes(design: Design, suffix: str) -> bytes:
+    suffix = suffix.lower()
     if suffix not in (".png", ".svg", ".jpg", ".jpeg", ".webp"):
         raise ValueError("Choose a PNG, SVG, JPG, or WebP filename.")
     if suffix == ".svg":
-        path.write_text(render_svg(design), encoding="utf-8")
+        return render_svg(design).encode("utf-8")
     else:
         image = render_image(design)
+        stream = io.BytesIO()
         if suffix in (".jpg", ".jpeg"):
             base = Image.new("RGBA", image.size, "white")
             image = Image.alpha_composite(base, image).convert("RGB")
-            image.save(path, quality=98, subsampling=0)
+            image.save(stream, format="JPEG", quality=98, subsampling=0)
         elif suffix == ".webp":
-            image.save(path, lossless=True)
+            image.save(stream, format="WEBP", lossless=True)
         else:
-            image.save(path)
+            image.save(stream, format="PNG")
+        return stream.getvalue()
+
+
+def save_design(design: Design, destination: str | Path, *, verify=False) -> Path:
+    path = Path(destination)
+    data = export_bytes(design, path.suffix)
+    if verify:
+        from .inspection import ScanCheckError, check_export
+
+        result = check_export(data, path.suffix, design.payload)
+        if not result.ok:
+            raise ScanCheckError(result.message, data)
+    path.write_bytes(data)
     return path

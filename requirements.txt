@@ -1,2 +1,5 @@
 qrcode[pil]>=8.2,<9
 Pillow>=11.1,<13
+zxing-cpp>=2.3,<4
+resvg-py>=0.5,<1
+tkinterdnd2>=0.4,<1

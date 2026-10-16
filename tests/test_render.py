@@ -1,10 +1,12 @@
 import tempfile
 import unittest
+import math
 from dataclasses import replace
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from PIL import Image, ImageDraw
+from qr_maker import render
 
 from qr_maker.render import (
     GRADIENTS, PRESETS, SHAPES, Options, build_design, normalize_url,
@@ -72,6 +74,30 @@ class QRTests(unittest.TestCase):
         bg = render_image(build_design(Options(background_opacity=50, size=256)))
         self.assertEqual(bg.getpixel((0, 0))[3], 128)
 
+    def test_cached_qr_data_is_immutable_and_styles_stay_independent(self):
+        first = build_design(Options(url="example.com/cache", foreground="#123456"))
+        second = build_design(Options(url="https://example.com/cache", foreground="#654321", shape="Dots"))
+        self.assertIs(first.matrix, second.matrix)
+        with self.assertRaises(TypeError):
+            first.matrix[0][0] = not first.matrix[0][0]
+        self.assertEqual(first.options.foreground, "#123456")
+        self.assertEqual(second.options.foreground, "#654321")
+        self.assertEqual(second.modules[0].kind, "Dots")
+
+    def test_fast_gradients_match_reference_within_two_color_levels(self):
+        side = 64
+        a, b = (18, 59, 131), (8, 124, 131)
+        for effect in GRADIENTS[1:]:
+            design = build_design(Options(foreground="#123b83", secondary="#087c83", gradient=effect))
+            image = render._gradient(design, side)
+            for y in range(side):
+                for x in range(side):
+                    u, v = x / (side - 1), y / (side - 1)
+                    t = {"Horizontal": u, "Vertical": v, "Diagonal": (u + v) / 2,
+                         "Radial": min(1, math.hypot(u - .5, v - .5) * 2)}[effect]
+                    expected = tuple(round(start + (end - start) * t) for start, end in zip(a, b))
+                    self.assertLessEqual(max(abs(actual - wanted) for actual, wanted in zip(image.getpixel((x, y))[:3], expected)), 2)
+
     def test_exports_and_self_contained_svg(self):
         design = build_design(Options(url="example.com/?a=1&b=2", size=512, logo_path=str(self.logo), transparent=True))
         for extension in ("png", "jpg", "webp", "svg"):
@@ -101,6 +127,29 @@ class QRTests(unittest.TestCase):
         warnings = build_design(Options(foreground="#ffffff", transparent=True)).warnings
         self.assertTrue(any("contrast" in warning for warning in warnings))
         self.assertTrue(any("Transparency" in warning for warning in warnings))
+
+    def test_logo_crop_circle_and_padding_keep_the_source_file_unchanged(self):
+        original = self.logo.read_bytes()
+        for crop in ("Fit", "Center crop", "Circle"):
+            design = build_design(Options(logo_path=str(self.logo), logo_crop=crop, logo_padding=15))
+            self.assertEqual(design.logo.width, design.logo.height)
+            self.assertEqual(design.logo.getpixel((0, 0))[3], 0)
+            self.assertIsNotNone(design.logo.getbbox())
+            self.assertEqual(self.logo.read_bytes(), original)
+            if crop == "Circle":
+                no_padding = build_design(Options(logo_path=str(self.logo), logo_crop="Circle"))
+                self.assertEqual(no_padding.logo.getpixel((0, 0))[3], 0)
+                center = no_padding.logo.width // 2
+                self.assertGreater(no_padding.logo.getpixel((center, center))[3], 0)
+
+    def test_logo_cache_refreshes_when_the_file_is_replaced(self):
+        path = self.directory / "changing.png"
+        Image.new("RGB", (40, 40), "red").save(path)
+        first = build_design(Options(logo_path=str(path)))
+        Image.new("RGB", (45, 45), "blue").save(path)
+        second = build_design(Options(logo_path=str(path)))
+        self.assertEqual(first.logo.getpixel((10, 10))[:3], (255, 0, 0))
+        self.assertEqual(second.logo.getpixel((10, 10))[:3], (0, 0, 255))
 
     @unittest.skipUnless(zxingcpp, "Install requirements-dev.txt for scanner tests")
     def test_presets_are_scannable(self):
